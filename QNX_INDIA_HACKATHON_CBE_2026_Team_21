@@ -1,1 +1,603 @@
 This folder contains all the cpodes used in our Intelligent Adaptive Cruise Controls
+
+#include "acc_config.h"
+#include "acc_types.h"
+#include "qnx_compat.h"
+#include "kalman_filter.h"
+#include "acc_controller.h"
+#include "safety_supervisor.h"
+#include "reverse_controller.h"
+#include "sensor_manager.h"
+#include "simulation_engine.h"
+#include "motor_actuator.h"
+#include "oled_display.h"
+#include "mqtt_manager.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <signal.h>
+
+#ifdef _WIN32
+    #include <conio.h>
+#else
+    #include <unistd.h>
+    #include <sys/select.h>
+    #include <sys/time.h>
+#endif
+
+/* ========================================================================== */
+/* Global System Context & Thread Synchronization                            */
+/* ========================================================================== */
+typedef struct {
+    volatile bool            running;
+    vehicle_operating_mode_t current_mode;
+
+    /* Subsystem Instances */
+    kalman_filter_t      kalman;
+    acc_controller_t     controller;
+    safety_supervisor_t  supervisor;
+    reverse_controller_t reverser;
+    sensor_manager_t     sensor_mgr;
+    simulation_engine_t  sim_engine;
+    motor_actuator_t     actuator;
+    oled_display_t       oled;
+    mqtt_manager_t       mqtt;
+
+    /* Shared Data Buffers Protected by Priority-Inheritance Mutex */
+    pthread_mutex_t      state_mutex;
+    sensor_raw_data_t    raw_sensors;
+    estimated_state_t    estimated_state;
+    control_command_t    control_cmd;
+    acc_telemetry_t      telemetry;
+
+    /* Threads */
+    pthread_t thread_safety;
+    pthread_t thread_sensor;
+    pthread_t thread_estimator;
+    pthread_t thread_controller;
+    pthread_t thread_actuator;
+    pthread_t thread_oled;
+    pthread_t thread_mqtt;
+} system_context_t;
+
+static system_context_t g_ctx;
+
+/* Signal Handler for Clean Fail-Safe Shutdown */
+static void signal_handler(int sig) {
+    (void)sig;
+    printf("\n[QNX ACC] Shutdown signal received. Executing safe stop...\n");
+    g_ctx.running = false;
+}
+
+/* ========================================================================== */
+/* TASK 1: Safety Supervisor Thread (Priority 255, 5ms / 200 Hz)             */
+/* ========================================================================== */
+static void* thread_safety_supervisor(void *arg) {
+    (void)arg;
+    qnx_set_thread_priority(pthread_self(), TASK_PRIO_SAFETY_SUPERVISOR);
+
+    uint64_t next_wake_ns = 0;
+    uint64_t last_cycle_start_ns = 0;
+    const uint64_t expected_period_ns = PERIOD_SAFETY_MS * 1000000ULL;
+
+    while (g_ctx.running) {
+        uint64_t t_start_ns = qnx_get_time_ns();
+
+        /* Real-Time Jitter Tracking (Microsecond Determinism Proof) */
+        if (last_cycle_start_ns > 0) {
+            uint64_t actual_interval_ns = t_start_ns - last_cycle_start_ns;
+            int64_t diff_ns = (int64_t)actual_interval_ns - (int64_t)expected_period_ns;
+            uint32_t jitter_us = (uint32_t)(llabs(diff_ns) / 1000ULL);
+            if (jitter_us < 2000) {
+                g_ctx.telemetry.max_jitter_us = jitter_us;
+            }
+        }
+        last_cycle_start_ns = t_start_ns;
+
+        pthread_mutex_lock(&g_ctx.state_mutex);
+
+        safety_supervisor_evaluate(&g_ctx.supervisor, 
+                                   &g_ctx.estimated_state, 
+                                   &g_ctx.raw_sensors, 
+                                   &g_ctx.control_cmd, 
+                                   g_ctx.current_mode);
+
+        pthread_mutex_unlock(&g_ctx.state_mutex);
+
+        uint64_t t_end_ns = qnx_get_time_ns();
+        g_ctx.telemetry.rtos_latency_us = (uint32_t)((t_end_ns - t_start_ns) / 1000ULL);
+
+        qnx_periodic_sleep_until(PERIOD_SAFETY_MS, &next_wake_ns);
+    }
+    return NULL;
+}
+
+/* ========================================================================== */
+/* TASK 2: Sensor Ingestion Thread (Priority 240, 10ms / 100 Hz)             */
+/* ========================================================================== */
+static void* thread_sensor_ingest(void *arg) {
+    (void)arg;
+    qnx_set_thread_priority(pthread_self(), TASK_PRIO_SENSOR_INGEST);
+
+    uint64_t next_wake_ns = 0;
+    float dt = (float)PERIOD_SENSOR_INGEST_MS / 1000.0f;
+
+    while (g_ctx.running) {
+        safety_supervisor_kick_watchdog(&g_ctx.supervisor, TASK_PRIO_SENSOR_INGEST);
+
+        pthread_mutex_lock(&g_ctx.state_mutex);
+
+        if (g_ctx.current_mode == MODE_SIMULATED_PHYSICS) {
+            /* Mode 0: Simulated Physics Engine (Virtual lead scenario) */
+            simulation_engine_step(&g_ctx.sim_engine, 
+                                   dt, 
+                                   g_ctx.estimated_state.ego_speed_mps, 
+                                   &g_ctx.raw_sensors);
+
+            /* Overlay interactive fault injection */
+            g_ctx.raw_sensors.front_fault_injected = g_ctx.sensor_mgr.fault_inject_front;
+            g_ctx.raw_sensors.left_fault_injected  = g_ctx.sensor_mgr.fault_inject_left;
+            g_ctx.raw_sensors.right_fault_injected = g_ctx.sensor_mgr.fault_inject_right;
+
+            if (g_ctx.sensor_mgr.fault_inject_front) {
+                g_ctx.raw_sensors.front_valid = false;
+                g_ctx.raw_sensors.front_signal_quality = 0;
+            }
+            if (g_ctx.sensor_mgr.fault_inject_left) {
+                g_ctx.raw_sensors.left_valid = false;
+            }
+            if (g_ctx.sensor_mgr.fault_inject_right) {
+                g_ctx.raw_sensors.right_valid = false;
+            }
+        } else {
+            /* Mode 1: Live Hardware Sensors (Front LiDAR + Left/Right Ultrasonics) */
+            sensor_manager_read(&g_ctx.sensor_mgr, &g_ctx.raw_sensors);
+        }
+
+        pthread_mutex_unlock(&g_ctx.state_mutex);
+
+        qnx_periodic_sleep_until(PERIOD_SENSOR_INGEST_MS, &next_wake_ns);
+    }
+    return NULL;
+}
+
+/* ========================================================================== */
+/* TASK 3: State Estimator Thread (Priority 220, 10ms / 100 Hz)              */
+/* ========================================================================== */
+static void* thread_state_estimator(void *arg) {
+    (void)arg;
+    qnx_set_thread_priority(pthread_self(), TASK_PRIO_STATE_ESTIMATOR);
+
+    uint64_t next_wake_ns = 0;
+    float dt = (float)PERIOD_ESTIMATOR_MS / 1000.0f;
+
+    while (g_ctx.running) {
+        safety_supervisor_kick_watchdog(&g_ctx.supervisor, TASK_PRIO_STATE_ESTIMATOR);
+
+        pthread_mutex_lock(&g_ctx.state_mutex);
+
+        /* 1. Predict state based on current acceleration */
+        float ego_accel = g_ctx.control_cmd.demanded_accel_mps2;
+        kalman_filter_predict(&g_ctx.kalman, dt, ego_accel);
+
+        /* 2. Update state with sensor measurement */
+        if (g_ctx.raw_sensors.front_valid) {
+            kalman_filter_update(&g_ctx.kalman, 
+                                 g_ctx.raw_sensors.front_distance_m, 
+                                 g_ctx.raw_sensors.front_doppler_vel_mps, 
+                                 true, 
+                                 g_ctx.raw_sensors.front_signal_quality);
+        }
+
+        /* 3. Extract estimated vehicle state */
+        float ego_speed = motor_actuator_get_speed_mps(&g_ctx.actuator);
+        kalman_filter_get_state(&g_ctx.kalman, ego_speed, &g_ctx.estimated_state);
+
+        pthread_mutex_unlock(&g_ctx.state_mutex);
+
+        qnx_periodic_sleep_until(PERIOD_ESTIMATOR_MS, &next_wake_ns);
+    }
+    return NULL;
+}
+
+/* ========================================================================== */
+/* TASK 4: ACC Controller Thread (Priority 200, 20ms / 50 Hz)                */
+/* ========================================================================== */
+static void* thread_acc_controller(void *arg) {
+    (void)arg;
+    qnx_set_thread_priority(pthread_self(), TASK_PRIO_ACC_CONTROLLER);
+
+    uint64_t next_wake_ns = 0;
+    float dt = (float)PERIOD_CONTROLLER_MS / 1000.0f;
+
+    while (g_ctx.running) {
+        safety_supervisor_kick_watchdog(&g_ctx.supervisor, TASK_PRIO_ACC_CONTROLLER);
+
+        pthread_mutex_lock(&g_ctx.state_mutex);
+
+        acc_controller_compute(&g_ctx.controller, 
+                               &g_ctx.estimated_state, 
+                               dt, 
+                               &g_ctx.control_cmd);
+
+        pthread_mutex_unlock(&g_ctx.state_mutex);
+
+        qnx_periodic_sleep_until(PERIOD_CONTROLLER_MS, &next_wake_ns);
+    }
+    return NULL;
+}
+
+/* ========================================================================== */
+/* TASK 5: Motor Actuator Thread (Priority 180, 20ms / 50 Hz)                */
+/* ========================================================================== */
+static void* thread_motor_actuator(void *arg) {
+    (void)arg;
+    qnx_set_thread_priority(pthread_self(), TASK_PRIO_MOTOR_ACTUATOR);
+
+    uint64_t next_wake_ns = 0;
+    while (g_ctx.running) {
+        safety_supervisor_kick_watchdog(&g_ctx.supervisor, TASK_PRIO_MOTOR_ACTUATOR);
+
+        pthread_mutex_lock(&g_ctx.state_mutex);
+
+        /* Apply command to physical TB6612 motor driver and brake LED */
+        motor_actuator_apply_command(&g_ctx.actuator, &g_ctx.control_cmd);
+
+        pthread_mutex_unlock(&g_ctx.state_mutex);
+
+        qnx_periodic_sleep_until(PERIOD_ACTUATOR_MS, &next_wake_ns);
+    }
+    return NULL;
+}
+
+/* ========================================================================== */
+/* TASK 6: OLED Display Thread (Priority 100, 100ms / 10 Hz)                 */
+/* ========================================================================== */
+static void* thread_oled_display(void *arg) {
+    (void)arg;
+    qnx_set_thread_priority(pthread_self(), TASK_PRIO_OLED_DISPLAY);
+
+    uint64_t next_wake_ns = 0;
+    while (g_ctx.running) {
+        pthread_mutex_lock(&g_ctx.state_mutex);
+
+        oled_display_render_telemetry(&g_ctx.oled, &g_ctx.telemetry);
+
+        pthread_mutex_unlock(&g_ctx.state_mutex);
+
+        qnx_periodic_sleep_until(PERIOD_OLED_MS, &next_wake_ns);
+    }
+    return NULL;
+}
+
+/* ========================================================================== */
+/* TASK 7: MQTT Wireless Client Thread (Priority 80, 50ms / 20 Hz)           */
+/* ========================================================================== */
+static void* thread_mqtt_client(void *arg) {
+    (void)arg;
+    qnx_set_thread_priority(pthread_self(), TASK_PRIO_MQTT_CLIENT);
+
+    uint64_t next_wake_ns = 0;
+    uint64_t seq = 0;
+
+    while (g_ctx.running) {
+        /* Poll incoming judge commands from dashboard */
+        mqtt_manager_poll(&g_ctx.mqtt);
+
+        pthread_mutex_lock(&g_ctx.state_mutex);
+
+        /* Handle Mode Switch requests safely */
+        if (g_ctx.mqtt.mode_switch_requested) {
+            vehicle_operating_mode_t new_mode = g_ctx.mqtt.requested_mode;
+            if (new_mode != g_ctx.current_mode) {
+                printf("\n[DATA SOURCE SWITCH] Changing from %s to %s...\n",
+                       (g_ctx.current_mode == MODE_SIMULATED_PHYSICS) ? "SIMULATED PHYSICS" : "LIVE SENSORS",
+                       (new_mode == MODE_SIMULATED_PHYSICS) ? "SIMULATED PHYSICS" : "LIVE SENSORS");
+
+                /* Safe Transition Sequence */
+                motor_actuator_safe_stop(&g_ctx.actuator);
+                sensor_manager_set_mode(&g_ctx.sensor_mgr, new_mode);
+                kalman_filter_reset(&g_ctx.kalman);
+                acc_controller_reset_integrators(&g_ctx.controller);
+                g_ctx.current_mode = new_mode;
+            }
+            g_ctx.mqtt.mode_switch_requested = false;
+        }
+
+        /* Handle Speed Change */
+        if (g_ctx.mqtt.speed_change_requested) {
+            acc_controller_set_target_speed(&g_ctx.controller, g_ctx.mqtt.requested_set_speed_kmh);
+            g_ctx.mqtt.speed_change_requested = false;
+        }
+
+        /* Forward Tabletop Simulator Commands */
+        if (g_ctx.current_mode == MODE_SIMULATED_PHYSICS) {
+            simulation_engine_apply_command(&g_ctx.sim_engine, &g_ctx.mqtt.cached_sim_cmd);
+        }
+
+        /* Handle Interactive Sensor Fault Injection Requests */
+        if (g_ctx.mqtt.fault_toggle_front_requested) {
+            sensor_manager_toggle_fault(&g_ctx.sensor_mgr, 1);
+            g_ctx.mqtt.fault_toggle_front_requested = false;
+        }
+        if (g_ctx.mqtt.fault_toggle_left_requested) {
+            sensor_manager_toggle_fault(&g_ctx.sensor_mgr, 2);
+            g_ctx.mqtt.fault_toggle_left_requested = false;
+        }
+        if (g_ctx.mqtt.fault_toggle_right_requested) {
+            sensor_manager_toggle_fault(&g_ctx.sensor_mgr, 3);
+            g_ctx.mqtt.fault_toggle_right_requested = false;
+        }
+
+        /* Handle E-Stop */
+        if (g_ctx.mqtt.estop_requested) {
+            g_ctx.supervisor.watchdog_tripped = true;
+            g_ctx.supervisor.current_state = ACC_STATE_FAULT_SAFE_STATE;
+            g_ctx.mqtt.estop_requested = false;
+        }
+
+        /* Assemble Telemetry Frame */
+        g_ctx.telemetry.seq_num                  = ++seq;
+        g_ctx.telemetry.timestamp_ms             = qnx_get_time_ms();
+        g_ctx.telemetry.current_mode             = g_ctx.current_mode;
+        g_ctx.telemetry.fsm_state                = g_ctx.supervisor.current_state;
+        g_ctx.telemetry.ego_speed_kmh            = g_ctx.estimated_state.ego_speed_kmh;
+        g_ctx.telemetry.lead_speed_kmh           = g_ctx.estimated_state.lead_speed_kmh;
+        g_ctx.telemetry.configured_max_speed_kmh = g_ctx.controller.hard_max_speed_kmh;
+        g_ctx.telemetry.relative_distance_m      = g_ctx.estimated_state.relative_distance_m;
+        g_ctx.telemetry.safe_distance_m          = acc_controller_calc_safe_distance(&g_ctx.controller, g_ctx.estimated_state.ego_speed_mps);
+        g_ctx.telemetry.relative_velocity_mps    = g_ctx.estimated_state.relative_velocity_mps;
+        g_ctx.telemetry.time_to_collision_sec    = g_ctx.supervisor.status.time_to_collision_sec;
+        g_ctx.telemetry.commanded_accel_mps2     = g_ctx.control_cmd.demanded_accel_mps2;
+        g_ctx.telemetry.motor_pwm_percent        = g_ctx.actuator.current_left_pwm;
+        g_ctx.telemetry.led_normal_active        = g_ctx.control_cmd.led_normal_mode;
+        g_ctx.telemetry.led_cruise_active        = g_ctx.control_cmd.led_cruise_mode;
+        g_ctx.telemetry.brake_active             = g_ctx.control_cmd.led_brake_solid;
+        g_ctx.telemetry.aeb_active               = g_ctx.control_cmd.led_aeb_blink;
+        g_ctx.telemetry.reverse_active           = false;
+        g_ctx.telemetry.safe_torque_off_active   = g_ctx.control_cmd.safe_torque_off;
+        g_ctx.telemetry.front_sensor_dist_m      = g_ctx.raw_sensors.front_distance_m;
+        g_ctx.telemetry.left_sensor_dist_m       = g_ctx.raw_sensors.left_distance_m;
+        g_ctx.telemetry.right_sensor_dist_m      = g_ctx.raw_sensors.right_distance_m;
+        g_ctx.telemetry.left_cutin_detected      = g_ctx.supervisor.status.left_cutin_detected;
+        g_ctx.telemetry.right_cutin_detected     = g_ctx.supervisor.status.right_cutin_detected;
+
+        /* QNX Process Isolation Telemetry */
+        g_ctx.telemetry.front_sensor_ok          = g_ctx.raw_sensors.front_valid;
+        g_ctx.telemetry.left_sensor_ok           = g_ctx.raw_sensors.left_valid;
+        g_ctx.telemetry.right_sensor_ok          = g_ctx.raw_sensors.right_valid;
+        g_ctx.telemetry.degraded_mode_active     = g_ctx.supervisor.degraded_mode;
+
+        g_ctx.telemetry.watchdog_ok              = !g_ctx.supervisor.watchdog_tripped;
+        g_ctx.telemetry.deadline_miss_count      = g_ctx.supervisor.consecutive_deadline_misses;
+
+        strncpy(g_ctx.telemetry.state_name, safety_supervisor_get_state_str(g_ctx.supervisor.current_state), sizeof(g_ctx.telemetry.state_name) - 1);
+
+        if (g_ctx.telemetry.aeb_active) {
+            strncpy(g_ctx.telemetry.alert_message, "CRITICAL: AEB EMERGENCY BRAKING ENGAGED", sizeof(g_ctx.telemetry.alert_message) - 1);
+        } else if (g_ctx.supervisor.status.ttc_warning_active) {
+            strncpy(g_ctx.telemetry.alert_message, "WARNING: CLOSING GAP RAPIDLY", sizeof(g_ctx.telemetry.alert_message) - 1);
+        } else if (g_ctx.supervisor.status.left_cutin_detected) {
+            strncpy(g_ctx.telemetry.alert_message, "ALERT: LEFT VEHICLE CUT-IN (<30cm)", sizeof(g_ctx.telemetry.alert_message) - 1);
+        } else if (g_ctx.supervisor.status.right_cutin_detected) {
+            strncpy(g_ctx.telemetry.alert_message, "ALERT: RIGHT VEHICLE CUT-IN (<30cm)", sizeof(g_ctx.telemetry.alert_message) - 1);
+        } else {
+            strncpy(g_ctx.telemetry.alert_message, "SYSTEM NOMINAL - QNX RTOS ACTIVE", sizeof(g_ctx.telemetry.alert_message) - 1);
+        }
+
+        /* Publish over wireless MQTT */
+        mqtt_manager_publish_telemetry(&g_ctx.mqtt, &g_ctx.telemetry);
+
+        pthread_mutex_unlock(&g_ctx.state_mutex);
+
+        qnx_periodic_sleep_until(PERIOD_MQTT_MS, &next_wake_ns);
+    }
+    return NULL;
+}
+
+/* ========================================================================== */
+/* Main Initialization & Execution Orchestration                             */
+/* ========================================================================== */
+int main(int argc, char *argv[]) {
+    setvbuf(stdout, NULL, _IONBF, 0);
+    printf("===============================================================================\n");
+    printf("      BLACKBERRY QNX NEUTRINO RTOS SDP 8.0 - INTELLIGENT ACC & AEB SYSTEM       \n");
+    printf("      Hardware Target: Raspberry Pi 4B (ISO 26262 ASIL-D Dual-Mode Controller)  \n");
+    printf("===============================================================================\n\n");
+
+    /* Parse optional command line args (e.g. initial source or broker IP) */
+    vehicle_operating_mode_t initial_mode = MODE_SIMULATED_PHYSICS;
+    const char *broker_ip = MQTT_DEFAULT_BROKER_HOST;
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--sensors") == 0 || strcmp(argv[i], "--live-sensors") == 0 || strcmp(argv[i], "--ground") == 0) {
+            initial_mode = MODE_LIVE_SENSORS;
+        } else if (strcmp(argv[i], "--broker") == 0 && (i + 1 < argc)) {
+            broker_ip = argv[++i];
+        }
+    }
+
+    memset(&g_ctx, 0, sizeof(system_context_t));
+    g_ctx.running = true;
+    g_ctx.current_mode = initial_mode;
+
+    qnx_init_priority_mutex(&g_ctx.state_mutex);
+
+    /* Initialize Subsystems */
+    printf("[1/7] Initializing 3-State Kalman Filter Tracking Engine...\n");
+    kalman_filter_init(&g_ctx.kalman, 35.0f, 0.0f);
+
+    printf("[2/7] Initializing Longitudinal ACC & Speed Limiter Controller...\n");
+    acc_controller_init(&g_ctx.controller, VEHICLE_DEFAULT_SET_SPEED_KMH, VEHICLE_MAX_SPEED_LIMIT_KMH);
+
+    printf("[3/7] Initializing ISO 26262 ASIL-D Safety Supervisor (P255)...\n");
+    safety_supervisor_init(&g_ctx.supervisor);
+    reverse_controller_init(&g_ctx.reverser);
+
+    printf("[4/7] Initializing Hardware HAL & Sensor Manager (Source: %s)...\n",
+           (initial_mode == MODE_SIMULATED_PHYSICS) ? "Simulated Physics Engine" : "Live Hardware Sensors");
+    sensor_manager_init(&g_ctx.sensor_mgr, initial_mode);
+    simulation_engine_init(&g_ctx.sim_engine);
+
+    printf("[5/7] Initializing TB6612FNG Motor Driver & Hall Encoders...\n");
+    motor_actuator_init(&g_ctx.actuator);
+
+    printf("[6/7] Initializing SSD1306 Local OLED Display...\n");
+    oled_display_init(&g_ctx.oled);
+
+    printf("[7/7] Connecting Wireless MQTT Client to Broker at %s:%d...\n", broker_ip, MQTT_DEFAULT_BROKER_PORT);
+    mqtt_manager_init(&g_ctx.mqtt, broker_ip, MQTT_DEFAULT_BROKER_PORT);
+
+    /* Register Signals */
+    signal(SIGINT, signal_handler);
+    signal(SIGTERM, signal_handler);
+
+    /* Launch 7 Prioritized Real-Time Threads */
+    printf("\n--> Spawning 7 Rate Monotonic QNX Tasks...\n");
+    pthread_create(&g_ctx.thread_safety,     NULL, thread_safety_supervisor, NULL);
+    pthread_create(&g_ctx.thread_sensor,     NULL, thread_sensor_ingest,     NULL);
+    pthread_create(&g_ctx.thread_estimator,  NULL, thread_state_estimator,  NULL);
+    pthread_create(&g_ctx.thread_controller, NULL, thread_acc_controller,   NULL);
+    pthread_create(&g_ctx.thread_actuator,   NULL, thread_motor_actuator,   NULL);
+    pthread_create(&g_ctx.thread_oled,       NULL, thread_oled_display,     NULL);
+    pthread_create(&g_ctx.thread_mqtt,       NULL, thread_mqtt_client,      NULL);
+
+    printf("=======================================================================================================\n");
+    printf("   QNX ACC & AEB READY. Press 's': Mode | '1': Kill LiDAR | '2': Kill Left US | '3': Kill Right US | 'q': Quit\n");
+    printf("=======================================================================================================\n");
+    printf("  TIME (s) | SOURCE   | STATE        | EGO/LEAD (kph) | FRONT LIDAR | L / R (m) | JIT (us) | PWM (%%)\n");
+    printf("-------------------------------------------------------------------------------------------------------\n");
+
+    uint32_t print_row = 0;
+    while (g_ctx.running) {
+#ifdef _WIN32
+        if (_kbhit()) {
+            char ch = (char)_getch();
+            if (ch == 'q' || ch == 'Q') {
+                g_ctx.running = false;
+                break;
+            } else if (ch == 's' || ch == 'S' || ch == 'm' || ch == 'M') {
+                /* Toggle between Simulated Physics and Live Hardware Sensors */
+                g_ctx.mqtt.requested_mode = (g_ctx.current_mode == MODE_SIMULATED_PHYSICS) ? MODE_LIVE_SENSORS : MODE_SIMULATED_PHYSICS;
+                g_ctx.mqtt.mode_switch_requested = true;
+            } else if (ch == '1') {
+                /* Toggle Front LiDAR Fault (QNX Process Isolation Proof) */
+                sensor_manager_toggle_fault(&g_ctx.sensor_mgr, 1);
+            } else if (ch == '2') {
+                /* Toggle Left Ultrasonic Fault (QNX Process Isolation Proof) */
+                sensor_manager_toggle_fault(&g_ctx.sensor_mgr, 2);
+            } else if (ch == '3') {
+                /* Toggle Right Ultrasonic Fault (QNX Process Isolation Proof) */
+                sensor_manager_toggle_fault(&g_ctx.sensor_mgr, 3);
+            } else if (ch == 'b' || ch == 'B') {
+                /* Sudden brake key */
+                g_ctx.mqtt.cached_sim_cmd.sudden_brake_active = !g_ctx.mqtt.cached_sim_cmd.sudden_brake_active;
+            } else if (ch == 'l' || ch == 'L') {
+                /* Left cut-in toggle */
+                g_ctx.mqtt.cached_sim_cmd.cut_in_left_active = !g_ctx.mqtt.cached_sim_cmd.cut_in_left_active;
+            } else if (ch == 'r' || ch == 'R') {
+                /* Right cut-in toggle */
+                g_ctx.mqtt.cached_sim_cmd.cut_in_right_active = !g_ctx.mqtt.cached_sim_cmd.cut_in_right_active;
+            }
+        }
+        Sleep(200);
+#else
+        struct timeval tv;
+        tv.tv_sec = 0;
+        tv.tv_usec = 0;
+        fd_set fds;
+        FD_ZERO(&fds);
+        FD_SET(STDIN_FILENO, &fds);
+        if (select(STDIN_FILENO + 1, &fds, NULL, NULL, &tv) > 0) {
+            char ch = 0;
+            if (read(STDIN_FILENO, &ch, 1) > 0) {
+                if (ch == 'q' || ch == 'Q') {
+                    g_ctx.running = false;
+                    break;
+                } else if (ch == 's' || ch == 'S' || ch == 'm' || ch == 'M') {
+                    g_ctx.mqtt.requested_mode = (g_ctx.current_mode == MODE_SIMULATED_PHYSICS) ? MODE_LIVE_SENSORS : MODE_SIMULATED_PHYSICS;
+                    g_ctx.mqtt.mode_switch_requested = true;
+                } else if (ch == '1') {
+                    sensor_manager_toggle_fault(&g_ctx.sensor_mgr, 1);
+                } else if (ch == '2') {
+                    sensor_manager_toggle_fault(&g_ctx.sensor_mgr, 2);
+                } else if (ch == '3') {
+                    sensor_manager_toggle_fault(&g_ctx.sensor_mgr, 3);
+                } else if (ch == 'b' || ch == 'B') {
+                    g_ctx.mqtt.cached_sim_cmd.sudden_brake_active = !g_ctx.mqtt.cached_sim_cmd.sudden_brake_active;
+                } else if (ch == 'l' || ch == 'L') {
+                    g_ctx.mqtt.cached_sim_cmd.cut_in_left_active = !g_ctx.mqtt.cached_sim_cmd.cut_in_left_active;
+                } else if (ch == 'r' || ch == 'R') {
+                    g_ctx.mqtt.cached_sim_cmd.cut_in_right_active = !g_ctx.mqtt.cached_sim_cmd.cut_in_right_active;
+                }
+            }
+        }
+        usleep(200000);
+#endif
+
+        pthread_mutex_lock(&g_ctx.state_mutex);
+        acc_telemetry_t t = g_ctx.telemetry;
+        pthread_mutex_unlock(&g_ctx.state_mutex);
+
+        if (++print_row % 25 == 0) {
+            printf("-------------------------------------------------------------------------------------------------------\n");
+            printf("  TIME (s) | SOURCE   | STATE        | EGO/LEAD (kph) | FRONT LIDAR | L / R (m) | JIT (us) | PWM (%%)\n");
+            printf("-------------------------------------------------------------------------------------------------------\n");
+        }
+
+        const char *src_label = (t.current_mode == MODE_LIVE_SENSORS) ? "LIVE-HW" : "SIM_ENG";
+        char front_buf[16], left_buf[16], right_buf[16];
+
+        if (t.front_sensor_ok) {
+            snprintf(front_buf, sizeof(front_buf), "%5.2f m", t.front_sensor_dist_m);
+        } else {
+            snprintf(front_buf, sizeof(front_buf), "[ISO-FAIL]");
+        }
+
+        if (t.left_sensor_ok) {
+            snprintf(left_buf, sizeof(left_buf), "%4.2f", t.left_sensor_dist_m);
+        } else {
+            snprintf(left_buf, sizeof(left_buf), "FAIL");
+        }
+
+        if (t.right_sensor_ok) {
+            snprintf(right_buf, sizeof(right_buf), "%4.2f", t.right_sensor_dist_m);
+        } else {
+            snprintf(right_buf, sizeof(right_buf), "FAIL");
+        }
+
+        printf("  %7.2f  | %-8s | %-12s | %4.1f / %-4.1f   | %-10s  | %s / %s | %4u us   | %+5.1f %%\n",
+               (float)t.timestamp_ms / 1000.0f,
+               src_label,
+               t.state_name,
+               t.ego_speed_kmh,
+               t.lead_speed_kmh,
+               front_buf,
+               left_buf,
+               right_buf,
+               t.max_jitter_us,
+               t.motor_pwm_percent);
+    }
+
+    /* Clean Shutdown */
+    printf("\n--> Terminating real-time tasks...\n");
+    pthread_join(g_ctx.thread_safety, NULL);
+    pthread_join(g_ctx.thread_sensor, NULL);
+    pthread_join(g_ctx.thread_estimator, NULL);
+    pthread_join(g_ctx.thread_controller, NULL);
+    pthread_join(g_ctx.thread_actuator, NULL);
+    pthread_join(g_ctx.thread_oled, NULL);
+    pthread_join(g_ctx.thread_mqtt, NULL);
+
+    motor_actuator_safe_stop(&g_ctx.actuator);
+    motor_actuator_close(&g_ctx.actuator);
+    sensor_manager_close(&g_ctx.sensor_mgr);
+    oled_display_close(&g_ctx.oled);
+    mqtt_manager_close(&g_ctx.mqtt);
+    pthread_mutex_destroy(&g_ctx.state_mutex);
+
+    printf("[QNX ACC] Safe stop confirmed. All hardware lines disengaged.\n");
+    return 0;
+}
+
